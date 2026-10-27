@@ -1,70 +1,24 @@
-use clap::{Parser, Subcommand};
-use serde::{Deserialize, Deserializer};
-mod comm;
-mod tools;
-use comm::*;
-use std::fmt;
-use std::fs;
-use tools::*;
+//! `iocc-bench` plugin.
+//!
+//! Controls an ignition output wired to an MCP23017 expander on the MCP2221
+//! bus. The executable is named `iocc-bench`, so `iocc bench <command>` runs it;
+//! `iocc tui` also finds it and asks for the manifest without recompiling iocc.
 
+use clap::{CommandFactory, Parser, Subcommand};
+use std::io::Write;
 use std::process::exit;
-use std::{thread::sleep, time::Duration};
+use std::time::Duration;
 
-#[derive(Debug)]
-pub struct HexU8(pub u8);
-
-impl<'de> Deserialize<'de> for HexU8 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let value =
-            u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(serde::de::Error::custom)?;
-        Ok(HexU8(value))
-    }
-}
-
-impl fmt::Display for HexU8 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{:02X}", self.0)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct Config {
-    address: u8,
-    verbose: bool,
-    i2c_speed_hz: u32,
-    reset_on_open: bool,
-    timeout: u64,
-    ont: Pinconf,
-}
-
-#[derive(Debug, Deserialize)]
-struct Pinconf {
-    port: Port,
-    pin: Pin,
-    direction: Direction,
-}
-
-#[derive(Debug, Deserialize)]
-struct RootConfig {
-    mitac: MitacConf,
-}
-#[derive(Debug, Deserialize)]
-struct MitacConf {
-    address: HexU8,
-    verbose: bool,
-    i2c_speed_hz: u32,
-    reset_on_open: bool,
-    timeout: u64,
-    ignition: Pinconf,
-}
+mod bus;
+use bus::Bus;
+mod config;
+use config::BenchConf;
+mod manifest;
+mod tools;
+use tools::{pin_dir, read_pin, set_pin_dir, write_pin};
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Control the bench ignition output through iocc", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -72,97 +26,125 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// On
+    /// Turn the ignition output ON
     On,
-    /// Off
+    /// Turn the ignition output OFF
     Off,
-    /// Status
-    Status,
-}
-
-#[derive(clap::ValueEnum, Copy, Clone, PartialEq, Eq, Debug)]
-enum Actions {
-    /// On
-    On,
-    /// Off
-    Off,
-    ///Status
-    Status,
-}
-
-fn read_config() -> MitacConf {
-    let config_content = fs::read_to_string("config.yaml").unwrap_or_default();
-
-    let parsed: Result<RootConfig, _> = serde_yaml::from_str(&config_content);
-    match parsed {
-        Ok(cfg) => cfg.mitac,
-        Err(_) => MitacConf {
-            address: HexU8(0x20),
-            verbose: false,
-            i2c_speed_hz: 400_000,
-            reset_on_open: false,
-            timeout: 10,
-            ignition: Pinconf {
-                port: Port::Portb,
-                pin: Pin::Pin1,
-                direction: Direction::Output,
-            },
-        },
-    }
+    /// Read the current ignition state
+    Status {
+        /// Print a JSON table (used by the iocc TUI)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Keep printing the ignition state until interrupted (TUI live panel)
+    Watch {
+        /// Milliseconds between samples
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+        /// Print one JSON metrics object per line
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
-    let cli = Cli::parse();
-    let config = read_config();
-    if config.verbose {
-        println!("[Mitac] Configuration: \n{:?}", config);
+    // Answered before anything else: the TUI asks for it without opening the
+    // device and without IOCC_HOST (the flag is handled here, not by iocc).
+    if std::env::args().any(|arg| arg == manifest::MANIFEST_FLAG) {
+        println!("{}", manifest::json());
+        return;
     }
-    let mut dev = match start_device(config.i2c_speed_hz, config.reset_on_open, config.timeout) {
-        Ok(x) => x,
-        Err(err) => {
-            println!("Error: {err}, check USB connection");
-            exit(1);
-        }
-    };
-    set_pin_dir(
-        &mut dev,
-        config.address.0,
-        config.ignition.port,
-        config.ignition.pin,
-        config.ignition.direction,
-    ); // Ignition
 
-    match &cli.command {
-        Some(Commands::On) => {
-            write_pin(
-                &mut dev,
-                config.address.0,
-                config.ignition.port,
-                config.ignition.pin,
-                1,
-            );
+    // Plugins are not standalone: iocc sets IOCC_HOST when it starts them.
+    if std::env::var_os("IOCC_HOST").is_none() {
+        eprintln!("iocc-bench is a plugin and must be run through iocc: iocc bench <command>");
+        exit(1);
+    }
+
+    let cli = Cli::parse();
+    let config = config::read();
+    if config.verbose {
+        println!("[bench] Configuration: {config:#?}");
+    }
+    if let Err(error) = run(&cli, &config) {
+        eprintln!("Error: {error}");
+        exit(1);
+    }
+}
+
+fn run(cli: &Cli, config: &BenchConf) -> bus::Result<()> {
+    let Some(command) = &cli.command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    let mut bus = Bus::open(config.i2c_speed_hz, config.reset_on_open, config.timeout)?;
+    match command {
+        Commands::On => switch(&mut bus, config, true),
+        Commands::Off => switch(&mut bus, config, false),
+        Commands::Status { json } => status(&mut bus, config, *json),
+        Commands::Watch { interval_ms, json } => watch(&mut bus, config, *interval_ms, *json),
+    }
+}
+
+/// Drives the configured pin, applying the direction from `config.yaml` first
+fn switch(bus: &mut Bus, config: &BenchConf, on: bool) -> bus::Result<()> {
+    let address = config.address.0;
+    let pin = config.ignition;
+    set_pin_dir(bus, address, pin.port, pin.pin, pin.direction)?;
+    write_pin(bus, address, pin.port, pin.pin, on as u8)?;
+    println!("Ignition {}", if on { "ON" } else { "OFF" });
+    Ok(())
+}
+
+fn status(bus: &mut Bus, config: &BenchConf, json: bool) -> bus::Result<()> {
+    let address = config.address.0;
+    let pin = config.ignition;
+    let direction = pin_dir(bus, address, pin.port, pin.pin)?;
+    let ignition = read_pin(bus, address, pin.port, pin.pin)?;
+    let info = bus.status()?;
+
+    if json {
+        println!(
+            "{}",
+            manifest::status_table(
+                &config.address.to_string(),
+                bus.transport(),
+                pin.port,
+                pin.pin,
+                direction,
+                pin.direction,
+                ignition,
+                &info,
+            )
+        );
+        return Ok(());
+    }
+
+    println!("Address   : {}", config.address);
+    println!("Transport : {}", bus.transport());
+    println!("Port      : {}", pin.port);
+    println!("Pin       : {}", pin.pin);
+    println!("Direction : {direction} (chip), {} (config)", pin.direction);
+    println!("Ignition  : {}", if ignition { "ON" } else { "OFF" });
+    println!("Bus       : {}", info.replace('\n', " "));
+    Ok(())
+}
+
+fn watch(bus: &mut Bus, config: &BenchConf, interval_ms: u64, json: bool) -> bus::Result<()> {
+    let address = config.address.0;
+    let pin = config.ignition;
+    let interval = Duration::from_millis(interval_ms.max(10));
+    loop {
+        let ignition = read_pin(bus, address, pin.port, pin.pin)?;
+        if json {
+            println!("{}", manifest::metrics(ignition));
+        } else {
+            println!("{}", if ignition { "ON" } else { "OFF" });
         }
-        Some(Commands::Off) => {
-            write_pin(
-                &mut dev,
-                config.address.0,
-                config.ignition.port,
-                config.ignition.pin,
-                0,
-            );
-        }
-        Some(Commands::Status) => {
-            let status = read_pin(
-                &mut dev,
-                config.address.0,
-                config.ignition.port,
-                config.ignition.pin,
-            );
-            match status {
-                0 => println!("OFF"),
-                _ => println!("ON"),
-            }
-        }
-        None => {}
+        // Streaming views read one sample per stdout line, so flush every line.
+        std::io::stdout().flush()?;
+        std::thread::sleep(interval);
     }
 }
