@@ -1,18 +1,25 @@
 iocc:
   address: 0x20
-  verbose: true
+  verbose: false
   i2c_speed_hz: 400000 #in Hz
   reset_on_open: false
   timeout: 10 # in milliseconds
 
-mitac:
+bench:
   address: 0x20
   verbose: false
   i2c_speed_hz: 400000 #in Hz
   reset_on_open: false
   timeout: 10 # in milliseconds
   ignition:
+    # Available ports:
+    #   porta
+    #   portb
     port: portb
+    # Available pins:
+    #   pin0 to pin7
     pin: pin1
+    # Available directions:
+    #   input
+    #   output
     direction: output
-    on_is: 0
