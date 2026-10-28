@@ -51,6 +51,27 @@ echo "==> Installing to ${BIN_DIR}"
 mkdir -p "$BIN_DIR"
 install -m 755 target/release/iocc-bench "${BIN_DIR}/iocc-bench"
 
+# The plugin settings live in the shared iocc config.yaml. Import the section
+# from this repository, keeping whatever the user already has (comments and
+# other sections are untouched; an existing 'bench:' section is kept).
+CONFIG_EXAMPLE="$(pwd)/config.yaml"
+IOCC_BIN=""
+if [ -x "${BIN_DIR}/iocc" ]; then
+    IOCC_BIN="${BIN_DIR}/iocc"
+elif command -v iocc >/dev/null 2>&1; then
+    IOCC_BIN="$(command -v iocc)"
+fi
+if [ -n "$IOCC_BIN" ]; then
+    echo "==> Adding the bench section to the iocc config"
+    if ! "$IOCC_BIN" config import "$CONFIG_EXAMPLE"; then
+        echo "warning: could not update the iocc config (iocc 1.2.0 or newer is required)." >&2
+        echo "         Add the 'bench:' section of ${CONFIG_EXAMPLE} by hand." >&2
+    fi
+else
+    echo "note: iocc not found, the 'bench:' section was not added to the config."
+    echo "      After installing iocc run: iocc config import ${CONFIG_EXAMPLE}"
+fi
+
 if ! command -v iocc >/dev/null 2>&1 && [ ! -x "${BIN_DIR}/iocc" ]; then
     echo "warning: iocc not found. Install it first; the plugin only runs through 'iocc bench'." >&2
 fi
@@ -62,4 +83,4 @@ case ":${PATH}:" in
 esac
 
 echo "Done. Try: iocc bench --help"
-echo "Settings go in the 'bench:' section of the iocc config.yaml (see ./config.yaml for an example)."
+echo "Settings live in the 'bench:' section of the iocc config.yaml (added on install)."

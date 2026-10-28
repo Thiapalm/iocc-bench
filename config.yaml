@@ -12,6 +12,7 @@ bench:
   reset_on_open: false
   timeout: 10 # in milliseconds
   ignition:
+    # `iocc bench set` saves the new port/pin/direction/logic here
     # Available ports:
     #   porta
     #   portb
@@ -23,3 +24,8 @@ bench:
     #   input
     #   output
     direction: output
+    # Inverted logic (active low). The bench relay is normally closed, so this
+    # defaults to true: ON drives the pin low and OFF drives it high.
+    #   false: normal (ON = high)
+    #   true:  inverted (ON = low)
+    inverted: true
