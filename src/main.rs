@@ -12,10 +12,10 @@ use std::time::Duration;
 mod bus;
 use bus::Bus;
 mod config;
-use config::BenchConf;
+use config::{BenchConf, Pinconf, save_ignition_entry};
 mod manifest;
 mod tools;
-use tools::{pin_dir, read_pin, set_pin_dir, write_pin};
+use tools::{Direction, Pin, Port, pin_dir, read_pin, set_pin_dir, write_pin};
 
 #[derive(Parser)]
 #[command(version, about = "Control the bench ignition output through iocc", long_about = None)]
@@ -45,13 +45,31 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Change the ignition pin configuration and save it in config.yaml
+    Set {
+        /// Expander port: porta or portb
+        #[arg(long)]
+        port: Option<Port>,
+        /// Expander pin: pin0 to pin7
+        #[arg(long)]
+        pin: Option<Pin>,
+        /// Pin direction: input or output
+        #[arg(long)]
+        direction: Option<Direction>,
+        /// Inverted logic: true drives the pin low for ON (normally closed relay)
+        #[arg(long, value_name = "BOOL")]
+        inverted: Option<bool>,
+        /// Do not write the change to config.yaml (temporary change)
+        #[arg(long)]
+        no_save: bool,
+    },
 }
 
 fn main() {
     // Answered before anything else: the TUI asks for it without opening the
     // device and without IOCC_HOST (the flag is handled here, not by iocc).
     if std::env::args().any(|arg| arg == manifest::MANIFEST_FLAG) {
-        println!("{}", manifest::json());
+        println!("{}", manifest::json(&config::read_quiet().ignition));
         return;
     }
 
@@ -85,24 +103,115 @@ fn run(cli: &Cli, config: &BenchConf) -> bus::Result<()> {
         Commands::Off => switch(&mut bus, config, false),
         Commands::Status { json } => status(&mut bus, config, *json),
         Commands::Watch { interval_ms, json } => watch(&mut bus, config, *interval_ms, *json),
+        Commands::Set {
+            port,
+            pin,
+            direction,
+            inverted,
+            no_save,
+        } => set(
+            &mut bus, config, *port, *pin, *direction, *inverted, *no_save,
+        ),
     }
 }
 
-/// Drives the configured pin, applying the direction from `config.yaml` first
+/// Drives the configured pin, applying the direction (and the inverted logic,
+/// when enabled) from `config.yaml` first
 fn switch(bus: &mut Bus, config: &BenchConf, on: bool) -> bus::Result<()> {
     let address = config.address.0;
     let pin = config.ignition;
     set_pin_dir(bus, address, pin.port, pin.pin, pin.direction)?;
-    write_pin(bus, address, pin.port, pin.pin, on as u8)?;
+    write_pin(bus, address, pin.port, pin.pin, pin.level(on))?;
     println!("Ignition {}", if on { "ON" } else { "OFF" });
     Ok(())
+}
+
+/// Applies the new pin configuration to the chip and persists it in the shared
+/// `config.yaml` (only the changed `bench.ignition.*` lines), like the power
+/// monitor does with the operating mode. `--no-save` keeps it in memory.
+fn set(
+    bus: &mut Bus,
+    config: &BenchConf,
+    port: Option<Port>,
+    pin: Option<Pin>,
+    direction: Option<Direction>,
+    inverted: Option<bool>,
+    no_save: bool,
+) -> bus::Result<()> {
+    if port.is_none() && pin.is_none() && direction.is_none() && inverted.is_none() {
+        return Err("nothing to change: pass --port, --pin, --direction and/or --inverted".into());
+    }
+
+    let mut ignition = config.ignition;
+    if let Some(port) = port {
+        ignition.port = port;
+    }
+    if let Some(pin) = pin {
+        ignition.pin = pin;
+    }
+    if let Some(direction) = direction {
+        ignition.direction = direction;
+    }
+    if let Some(inverted) = inverted {
+        ignition.inverted = inverted;
+    }
+
+    // The chip accepts the change first, so the file always matches the device
+    set_pin_dir(
+        bus,
+        config.address.0,
+        ignition.port,
+        ignition.pin,
+        ignition.direction,
+    )?;
+    print_ignition(&ignition);
+
+    if no_save {
+        println!("(temporary; without --no-save it is kept in config.yaml)");
+        return Ok(());
+    }
+
+    let mut saved = None;
+    for (changed, key, value) in [
+        (port.is_some(), "port", ignition.port.to_string()),
+        (pin.is_some(), "pin", ignition.pin.to_string()),
+        (
+            direction.is_some(),
+            "direction",
+            ignition.direction.to_string(),
+        ),
+        (
+            inverted.is_some(),
+            "inverted",
+            ignition.inverted.to_string(),
+        ),
+    ] {
+        if changed {
+            saved = Some(save_ignition_entry(key, &value)?);
+        }
+    }
+    if let Some(path) = saved {
+        println!("Saved in {}", path.display());
+    }
+    Ok(())
+}
+
+fn print_ignition(ignition: &Pinconf) {
+    println!(
+        "Ignition pin: {} {} {}, {}",
+        ignition.port,
+        ignition.pin,
+        ignition.direction,
+        ignition.logic()
+    );
 }
 
 fn status(bus: &mut Bus, config: &BenchConf, json: bool) -> bus::Result<()> {
     let address = config.address.0;
     let pin = config.ignition;
     let direction = pin_dir(bus, address, pin.port, pin.pin)?;
-    let ignition = read_pin(bus, address, pin.port, pin.pin)?;
+    let level = read_pin(bus, address, pin.port, pin.pin)?;
+    let ignition = pin.ignition(level);
     let info = bus.status()?;
 
     if json {
@@ -111,10 +220,9 @@ fn status(bus: &mut Bus, config: &BenchConf, json: bool) -> bus::Result<()> {
             manifest::status_table(
                 &config.address.to_string(),
                 bus.transport(),
-                pin.port,
-                pin.pin,
+                &pin,
                 direction,
-                pin.direction,
+                level,
                 ignition,
                 &info,
             )
@@ -127,6 +235,8 @@ fn status(bus: &mut Bus, config: &BenchConf, json: bool) -> bus::Result<()> {
     println!("Port      : {}", pin.port);
     println!("Pin       : {}", pin.pin);
     println!("Direction : {direction} (chip), {} (config)", pin.direction);
+    println!("Logic     : {}", pin.logic());
+    println!("Level     : {}", if level { "high" } else { "low" });
     println!("Ignition  : {}", if ignition { "ON" } else { "OFF" });
     println!("Bus       : {}", info.replace('\n', " "));
     Ok(())
@@ -137,7 +247,7 @@ fn watch(bus: &mut Bus, config: &BenchConf, interval_ms: u64, json: bool) -> bus
     let pin = config.ignition;
     let interval = Duration::from_millis(interval_ms.max(10));
     loop {
-        let ignition = read_pin(bus, address, pin.port, pin.pin)?;
+        let ignition = pin.ignition(read_pin(bus, address, pin.port, pin.pin)?);
         if json {
             println!("{}", manifest::metrics(ignition));
         } else {

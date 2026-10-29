@@ -84,6 +84,48 @@ impl Display for Direction {
     }
 }
 
+impl std::str::FromStr for Port {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        match text {
+            "porta" => Ok(Port::Porta),
+            "portb" => Ok(Port::Portb),
+            _ => Err(format!("invalid port '{text}': use porta or portb")),
+        }
+    }
+}
+
+impl std::str::FromStr for Pin {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        match text {
+            "pin0" => Ok(Pin::Pin0),
+            "pin1" => Ok(Pin::Pin1),
+            "pin2" => Ok(Pin::Pin2),
+            "pin3" => Ok(Pin::Pin3),
+            "pin4" => Ok(Pin::Pin4),
+            "pin5" => Ok(Pin::Pin5),
+            "pin6" => Ok(Pin::Pin6),
+            "pin7" => Ok(Pin::Pin7),
+            _ => Err(format!("invalid pin '{text}': use pin0 to pin7")),
+        }
+    }
+}
+
+impl std::str::FromStr for Direction {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        match text {
+            "input" => Ok(Direction::Input),
+            "output" => Ok(Direction::Output),
+            _ => Err(format!("invalid direction '{text}': use input or output")),
+        }
+    }
+}
+
 /**
  * Reads one byte from a register of one port of the MCP23017
  */
